@@ -16,6 +16,7 @@ Training utilities are included below for convenience.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Any
 from pathlib import Path
@@ -85,6 +86,15 @@ class HritikConfig:
     mmd_weight: float = 0.0
     film: bool = True
     lora_rank: int = 0  # 0 disables LoRA
+    # Autoregressive decoder options
+    autoregressive: bool = True
+    dec_hidden: int = 256
+    dec_embed: int = 128
+    # Decoding hyperparameters
+    beam_size: int = 0  # 0 or 1 -> greedy; >1 -> beam search
+    len_penalty: float = 0.0  # >0 encourages longer outputs
+    rep_penalty: float = 0.0  # >0 discourages repeated tokens
+    temperature: float = 1.0  # logits temperature at decode time
 
 
 def glorot(key, shape):
@@ -111,9 +121,33 @@ def init_params(key, n_channels: int, cfg: HritikConfig) -> Dict[str, Any]:
     params["attn_Wv"] = glorot(k4, (cfg.d_model, cfg.d_latent))
     params["attn_bo"] = jnp.zeros((cfg.d_latent,))
 
-    # Decoder head produces logits for each position independently
-    params["dec_W"] = glorot(k4, (cfg.d_latent, cfg.vocab_max_len * 64))  # 64 is placeholder vocab size; real head created at train-time
-    params["dec_b"] = jnp.zeros((cfg.vocab_max_len * 64,))
+    # Decoder head
+    if cfg.autoregressive:
+        # AR head params will be initialized at train-time when vocab size known
+        # Use float dtype so it's compatible with JAX autodiff (avoid int leaves in params)
+        params["ar_initialized"] = jnp.array(0.0, dtype=jnp.float32)
+        # Provisional shapes; real shapes set when stoi size is known
+        params["dec_W_init"] = glorot(k4, (cfg.d_latent, cfg.dec_hidden))
+        params["dec_b_init"] = jnp.zeros((cfg.dec_hidden,))
+        # GRU weights: z,r gates and candidate
+        # Shapes depend on (dec_embed + d_latent) -> dec_hidden
+        din = cfg.dec_embed + cfg.d_latent
+        H = cfg.dec_hidden
+        k5, k6, k7, k8, k9, k10 = random.split(k4, 6)
+        params["gru_Wz"] = glorot(k5, (din, H))
+        params["gru_Uz"] = glorot(k6, (H, H))
+        params["gru_bz"] = jnp.zeros((H,))
+        params["gru_Wr"] = glorot(k7, (din, H))
+        params["gru_Ur"] = glorot(k8, (H, H))
+        params["gru_br"] = jnp.zeros((H,))
+        params["gru_Wh"] = glorot(k9, (din, H))
+        params["gru_Uh"] = glorot(k10, (H, H))
+        params["gru_bh"] = jnp.zeros((H,))
+        # Output head and embedding will be (re)initialized with correct vocab later
+    else:
+        # Non-AR independent positions
+        params["dec_W"] = glorot(k4, (cfg.d_latent, cfg.vocab_max_len * 64))  # placeholder; reset at train-time
+        params["dec_b"] = jnp.zeros((cfg.vocab_max_len * 64,))
 
     # FiLM generator from session embedding
     params["film_W"] = glorot(k1, (cfg.d_latent, 2 * cfg.d_latent))
@@ -127,20 +161,28 @@ def init_params(key, n_channels: int, cfg: HritikConfig) -> Dict[str, Any]:
             "attn_Wk": (cfg.d_model, cfg.d_latent),
             "attn_Wv": (cfg.d_model, cfg.d_latent),
         }.items():
-            kA, kB = random.split(key)
-            params[f"{name}_lora_A"] = glorot(kA, (din, r))
+            k_a, _ = random.split(key)
+            params[f"{name}_lora_A"] = glorot(k_a, (din, r))
             params[f"{name}_lora_B"] = jnp.zeros((r, dout))
 
     return params
 
 
-def linear(x, W, b):
-    return x @ W + b
+def linear(x, w, b):
+    return x @ w + b
 
 
 def cross_attention(latents, x_enc, params, cfg: HritikConfig):
     # latents: L x D; x_enc: T x D_in (here mean pooled -> 1 x D)
     Wq, Wk, Wv = params["attn_Wq"], params["attn_Wk"], params["attn_Wv"]
+    # Apply LoRA adapters if configured
+    if cfg.lora_rank > 0:
+        if "attn_Wq_lora_A" in params and "attn_Wq_lora_B" in params:
+            Wq = Wq + params["attn_Wq_lora_A"] @ params["attn_Wq_lora_B"]
+        if "attn_Wk_lora_A" in params and "attn_Wk_lora_B" in params:
+            Wk = Wk + params["attn_Wk_lora_A"] @ params["attn_Wk_lora_B"]
+        if "attn_Wv_lora_A" in params and "attn_Wv_lora_B" in params:
+            Wv = Wv + params["attn_Wv_lora_A"] @ params["attn_Wv_lora_B"]
     q = latents @ Wq  # L x D
     k = x_enc @ Wk    # B(=1) x D
     v = x_enc @ Wv
@@ -223,12 +265,22 @@ class HritikDecoder(BCIDecoder):
             self.params = init_params(self.rng, self._task_config.n_channels, self.cfg)
             # Replace decoder head to correct vocab size
             D = self.cfg.d_latent
-            self.params["dec_W"] = glorot(self.rng, (D, self.cfg.vocab_max_len * self.vocab_size))
-            self.params["dec_b"] = jnp.zeros((self.cfg.vocab_max_len * self.vocab_size,))
+            if self.cfg.autoregressive:
+                # Initialize AR embedding and output head with correct vocab
+                self.params["dec_E"] = glorot(self.rng, (self.vocab_size, self.cfg.dec_embed))
+                self.params["dec_Wout"] = glorot(self.rng, (self.cfg.dec_hidden, self.vocab_size))
+                self.params["dec_bout"] = jnp.zeros((self.vocab_size,))
+                # Keep float dtype for autodiff compatibility
+                self.params["ar_initialized"] = jnp.array(1.0, dtype=jnp.float32)
+            else:
+                self.params["dec_W"] = glorot(self.rng, (D, self.cfg.vocab_max_len * self.vocab_size))
+                self.params["dec_b"] = jnp.zeros((self.cfg.vocab_max_len * self.vocab_size,))
 
     # ------------- Inference API -------------
-    def reset(self, dataset_tags: List[str] = [""]):
+    def reset(self, dataset_tags: List[str] | None = None):
         # dataset_tags contains filenames; map to session string
+        if dataset_tags is None or len(dataset_tags) == 0:
+            dataset_tags = [""]
         tag = dataset_tags[0]
         if isinstance(tag, Path):
             tag = tag.stem
@@ -256,11 +308,96 @@ class HritikDecoder(BCIDecoder):
         if not self.trial_buffer:
             return ""
         spikes = np.stack(self.trial_buffer, axis=0)  # T x C
-        pred = self.decode_trial(spikes, self.current_session)
+        pred = self.decode_trial(spikes, self.current_session or "")
         self.trial_buffer = []
         return pred
 
     # ------------- Trial decode -------------
+    def _gru_step(self, h, x, params):
+        # x: (din,), h: (H,)
+        Wz, Uz, bz = params["gru_Wz"], params["gru_Uz"], params["gru_bz"]
+        Wr, Ur, br = params["gru_Wr"], params["gru_Ur"], params["gru_br"]
+        Wh, Uh, bh = params["gru_Wh"], params["gru_Uh"], params["gru_bh"]
+        z = jax.nn.sigmoid(x @ Wz + h @ Uz + bz)
+        r = jax.nn.sigmoid(x @ Wr + h @ Ur + br)
+        h_tilde = jnp.tanh(x @ Wh + (r * h) @ Uh + bh)
+        h_new = (1 - z) * h + z * h_tilde
+        return h_new
+
+    def _decode_autoregressive(self, z: jnp.ndarray, params, max_len: int) -> str:
+        # Initialize hidden state from z
+        h = jnp.tanh(z @ params["dec_W_init"] + params["dec_b_init"])  # (H,)
+        E = params["dec_E"]
+        Wout, bout = params["dec_Wout"], params["dec_bout"]
+        itos = self.itos
+        stoi = self.stoi
+        eos_id = stoi["<eos>"]
+        # Start with space token if available else 'a'
+        start_id = stoi.get(" ", next(iter(stoi.values())))
+        seq = []
+        prev_id = start_id
+        beam_size = int(max(1, self.cfg.beam_size))
+        temperature = max(1e-3, float(self.cfg.temperature))
+
+        def logits_from_h(h):
+            logits = h @ Wout + bout
+            logits = logits / temperature
+            return logits
+
+        if beam_size <= 1:
+            for _ in range(max_len):
+                emb = E[prev_id]
+                x_in = jnp.concatenate([emb, z], axis=-1)
+                h = self._gru_step(h, x_in, params)
+                logits = logits_from_h(h)
+                if self.cfg.rep_penalty > 0.0 and len(seq) > 0:
+                    # Penalize last token repetition
+                    logits = logits.at[prev_id].add(-self.cfg.rep_penalty)
+                next_id = int(jnp.argmax(logits))
+                if next_id == eos_id:
+                    break
+                seq.append(next_id)
+                prev_id = next_id
+            ids = np.array(seq, dtype=np.int32)
+            return decode_ids(ids, itos)
+        else:
+            # Simple beam search over AR decoder
+            beams = [(0.0, [], prev_id, h)]  # (score, seq, prev_id, h)
+            for t in range(max_len):
+                new_beams = []
+                for score, seq, prev_id, h in beams:
+                    emb = E[prev_id]
+                    x_in = jnp.concatenate([emb, z], axis=-1)
+                    h_new = self._gru_step(h, x_in, params)
+                    logits = logits_from_h(h_new)
+                    if self.cfg.rep_penalty > 0.0 and len(seq) > 0:
+                        logits = logits.at[seq[-1]].add(-self.cfg.rep_penalty)
+                    log_probs = jax.nn.log_softmax(logits)
+                    topk = int(min(self.vocab_size, beam_size))
+                    # get topk indices
+                    top_ids = np.array(jnp.argsort(-log_probs)[:topk])
+                    top_vals = np.array(log_probs[top_ids])
+                    for nid, lp in zip(top_ids, top_vals):
+                        nid = int(nid)
+                        if nid == eos_id:
+                            # length penalty on completed sequence
+                            L = max(1, len(seq))
+                            lp_adj = float(lp)
+                            if self.cfg.len_penalty != 0.0:
+                                lp_adj = lp_adj - self.cfg.len_penalty * math.log(L + 1)
+                            new_beams.append((score + lp_adj, seq, prev_id, h_new))
+                        else:
+                            new_beams.append((score + float(lp), seq + [nid], nid, h_new))
+                # prune
+                new_beams.sort(key=lambda x: -x[0])
+                beams = new_beams[:beam_size]
+                # Early stop if best beam ended with EOS this step and others much worse
+                if any(len(b[1]) == 0 for b in beams):
+                    pass
+            best = max(beams, key=lambda x: x[0])
+            ids = np.array(best[1], dtype=np.int32)
+            return decode_ids(ids, itos)
+
     def decode_trial(self, spikes: np.ndarray, session_id: str) -> str:
         x = jnp.asarray(spikes)
         params = self.params
@@ -281,11 +418,14 @@ class HritikDecoder(BCIDecoder):
         z = cross_attention(latents, h[None, :], params, cfg)  # L x D
         z = jnp.mean(z, axis=0)  # D
         z = apply_film(z, sess_vec, params, cfg)
-        # Decode tokens (independent positions)
-        logits = linear(z, params["dec_W"], params["dec_b"])  # (max_len * vocab)
-        logits = logits.reshape((cfg.vocab_max_len, self.vocab_size))
-        ids = jnp.argmax(logits, axis=-1)
-        return decode_ids(np.array(ids, dtype=np.int32), self.itos)
+        if cfg.autoregressive and params is not None and ("dec_E" in params) and ("dec_Wout" in params):
+            return self._decode_autoregressive(z, params, max_len=cfg.vocab_max_len)
+        else:
+            # Decode tokens (independent positions)
+            logits = linear(z, params["dec_W"], params["dec_b"])  # (max_len * vocab)
+            logits = logits.reshape((cfg.vocab_max_len, self.vocab_size))
+            ids = jnp.argmax(logits, axis=-1)
+            return decode_ids(np.array(ids, dtype=np.int32), self.itos)
 
     # ------------- Persistence -------------
     def save(self, path: str | Path):
@@ -299,7 +439,7 @@ class HritikDecoder(BCIDecoder):
         np.savez_compressed(path, payload=json.dumps({k: None for k in payload.keys()}))
         # Save arrays separately to keep compatibility
         np.savez_compressed(path.with_suffix(".arrays.npz"), **{k: np.array(v) if isinstance(v, (np.ndarray, jnp.ndarray)) else np.array(0) for k, v in self.params.items() if isinstance(v, (np.ndarray, jnp.ndarray))})
-        with open(path.with_suffix(".meta.json"), "w") as f:
+        with open(path.with_suffix(".meta.json"), "w", encoding="utf-8") as f:
             json.dump({"cfg": self.cfg.__dict__, "stoi": self.stoi, "itos": self.itos}, f)
 
     def load(self, path: str | Path):
@@ -312,15 +452,37 @@ class HritikDecoder(BCIDecoder):
             for k in arrays.files:
                 params[k] = jnp.asarray(arrays[k])
             # Some non-array params might be missing; initialize defaults
-            if "dec_W" not in params or "dec_b" not in params:
-                params.update(init_params(self.rng, self._task_config.n_channels, self.cfg))
+            if self.cfg.autoregressive:
+                # Ensure AR params present
+                base = init_params(self.rng, self._task_config.n_channels, self.cfg)
+                for k in [
+                    "dec_W_init","dec_b_init","gru_Wz","gru_Uz","gru_bz","gru_Wr","gru_Ur","gru_br","gru_Wh","gru_Uh","gru_bh"
+                ]:
+                    if k not in params:
+                        params[k] = base[k]
+                # Embedding / output head may be missing
+                if "dec_E" not in params:
+                    params["dec_E"] = glorot(self.rng, (self.vocab_size, self.cfg.dec_embed))
+                if "dec_Wout" not in params or "dec_bout" not in params:
+                    params["dec_Wout"] = glorot(self.rng, (self.cfg.dec_hidden, self.vocab_size))
+                    params["dec_bout"] = jnp.zeros((self.vocab_size,))
+                params["ar_initialized"] = jnp.array(1.0, dtype=jnp.float32)
+            else:
+                if "dec_W" not in params or "dec_b" not in params:
+                    params.update(init_params(self.rng, self._task_config.n_channels, self.cfg))
             self.params = params
         else:
             # Fallback initialize
             self.params = init_params(self.rng, self._task_config.n_channels, self.cfg)
             D = self.cfg.d_latent
-            self.params["dec_W"] = glorot(self.rng, (D, self.cfg.vocab_max_len * len(self.stoi)))
-            self.params["dec_b"] = jnp.zeros((self.cfg.vocab_max_len * len(self.stoi),))
+            if self.cfg.autoregressive:
+                self.params["dec_E"] = glorot(self.rng, (self.vocab_size, self.cfg.dec_embed))
+                self.params["dec_Wout"] = glorot(self.rng, (self.cfg.dec_hidden, self.vocab_size))
+                self.params["dec_bout"] = jnp.zeros((self.vocab_size,))
+                self.params["ar_initialized"] = jnp.array(1.0, dtype=jnp.float32)
+            else:
+                self.params["dec_W"] = glorot(self.rng, (D, self.cfg.vocab_max_len * len(self.stoi)))
+                self.params["dec_b"] = jnp.zeros((self.cfg.vocab_max_len * len(self.stoi),))
 
 
 # ---------------------------
@@ -387,10 +549,30 @@ def train_hritik(
     # Initialize params and include normalization stats before optimizer init
     params = init_params(rng, n_channels=trials[0][0].shape[-1], cfg=cfg)
     D = cfg.d_latent
-    params["dec_W"] = glorot(rng, (D, cfg.vocab_max_len * len(stoi)))
-    params["dec_b"] = jnp.zeros((cfg.vocab_max_len * len(stoi),))
+    if cfg.autoregressive:
+        # Initialize AR-specific params with vocab size
+        params["dec_E"] = glorot(rng, (len(stoi), cfg.dec_embed))
+        params["dec_Wout"] = glorot(rng, (cfg.dec_hidden, len(stoi)))
+        params["dec_bout"] = jnp.zeros((len(stoi),))
+        # Keep a float flag to avoid integer leaves in the parameter pytree
+        params["ar_initialized"] = jnp.array(1.0, dtype=jnp.float32)
+    else:
+        params["dec_W"] = glorot(rng, (D, cfg.vocab_max_len * len(stoi)))
+        params["dec_b"] = jnp.zeros((cfg.vocab_max_len * len(stoi),))
     params["enc_norm_mean"] = jnp.asarray(enc_mean)
     params["enc_norm_std"] = jnp.asarray(enc_std)
+
+    # Ensure all parameter leaves are floating-point (JAX grad requires inexact dtypes)
+    def _to_float_leaves(x):
+        if isinstance(x, (jnp.ndarray, np.ndarray)):
+            try:
+                if not jnp.issubdtype(x.dtype, jnp.inexact):
+                    return x.astype(jnp.float32)
+            except Exception:
+                # If dtype check fails, fall back to float32 cast conservatively
+                return jnp.asarray(x, dtype=jnp.float32)
+        return x
+    params = jax.tree_util.tree_map(_to_float_leaves, params)
 
     opt = optax.chain(
         optax.clip_by_global_norm(1.0),
@@ -404,22 +586,63 @@ def train_hritik(
         h = jax.nn.relu(x_mean @ params["enc_W1"] + params["enc_b1"])  # (B, D)
         # Cross-attend per-sample
         z = jax.vmap(lambda hv: jnp.mean(cross_attention(params["latents"], hv[None, :], params, cfg), axis=0))(h)  # (B, D)
-        # FiLM zero during training
-        z = z  # apply_film with zeros would be no-op
-        # Decode
+        # FiLM zero during training (session vecs not used)
         z = jnp.nan_to_num(z, nan=0.0, posinf=0.0, neginf=0.0)
-        logits_flat = z @ params["dec_W"] + params["dec_b"]  # (B, L*V)
-        logits_flat = jnp.nan_to_num(logits_flat, nan=0.0, posinf=0.0, neginf=0.0)
         V = len(stoi)
         L = train_cfg.max_len
-        logits = logits_flat.reshape((logits_flat.shape[0], L, V))
-        mask = (token_ids != -1)
-        # Stable CE via log-softmax + masked one-hot
-        log_probs = logits - jax.scipy.special.logsumexp(logits, axis=-1, keepdims=True)
-        safe_labels = jnp.where(mask, jnp.clip(token_ids, 0, V - 1), 0)
-        tgt = jax.nn.one_hot(safe_labels, V, dtype=log_probs.dtype)
-        ce_per = -jnp.sum(tgt * log_probs, axis=-1)
-        ce = jnp.sum(ce_per * mask) / (jnp.sum(mask) + 1e-6)
+        if cfg.autoregressive:
+            # Teacher-forced AR loss
+            E = params["dec_E"]
+            Winit, binit = params["dec_W_init"], params["dec_b_init"]
+            Wout, bout = params["dec_Wout"], params["dec_bout"]
+
+            def ar_loss_single(zv, toks):
+                # Initialize hidden
+                h0 = jnp.tanh(zv @ Winit + binit)
+                # Build inputs: start token then toks[:-1]
+                start_id = 0  # use first vocab token as start (space typically index 26)
+                toks_in = jnp.concatenate([jnp.array([start_id], dtype=jnp.int32), jnp.maximum(toks[:-1], 0)])
+                mask = (toks != -1)
+                def step(carry, t):
+                    h = carry
+                    prev_id = toks_in[t]
+                    emb = E[prev_id]
+                    x_in = jnp.concatenate([emb, zv], axis=-1)
+                    # GRU step
+                    h = self_like_gru_step(h, x_in, params)
+                    logits = h @ Wout + bout
+                    return h, logits
+                # Helper: functional GRU step sharing params
+                def self_like_gru_step(h, x, p):
+                    Wz, Uz, bz = p["gru_Wz"], p["gru_Uz"], p["gru_bz"]
+                    Wr, Ur, br = p["gru_Wr"], p["gru_Ur"], p["gru_br"]
+                    Wh, Uh, bh = p["gru_Wh"], p["gru_Uh"], p["gru_bh"]
+                    z = jax.nn.sigmoid(x @ Wz + h @ Uz + bz)
+                    r = jax.nn.sigmoid(x @ Wr + h @ Ur + br)
+                    h_tilde = jnp.tanh(x @ Wh + (r * h) @ Uh + bh)
+                    return (1 - z) * h + z * h_tilde
+                h_final, logits_seq = jax.lax.scan(step, h0, jnp.arange(L))
+                # CE
+                log_probs = logits_seq - jax.scipy.special.logsumexp(logits_seq, axis=-1, keepdims=True)
+                safe_labels = jnp.where(mask, jnp.clip(toks, 0, V - 1), 0)
+                tgt = jax.nn.one_hot(safe_labels, V, dtype=log_probs.dtype)
+                ce_per = -jnp.sum(tgt * log_probs, axis=-1)
+                ce = jnp.sum(ce_per * mask) / (jnp.sum(mask) + 1e-6)
+                return ce
+
+            ce = jnp.mean(jax.vmap(ar_loss_single)(z, token_ids))
+        else:
+            # Parallel independent positions loss
+            logits_flat = z @ params["dec_W"] + params["dec_b"]  # (B, L*V)
+            logits_flat = jnp.nan_to_num(logits_flat, nan=0.0, posinf=0.0, neginf=0.0)
+            logits = logits_flat.reshape((logits_flat.shape[0], L, V))
+            mask = (token_ids != -1)
+            # Stable CE via log-softmax + masked one-hot
+            log_probs = logits - jax.scipy.special.logsumexp(logits, axis=-1, keepdims=True)
+            safe_labels = jnp.where(mask, jnp.clip(token_ids, 0, V - 1), 0)
+            tgt = jax.nn.one_hot(safe_labels, V, dtype=log_probs.dtype)
+            ce_per = -jnp.sum(tgt * log_probs, axis=-1)
+            ce = jnp.sum(ce_per * mask) / (jnp.sum(mask) + 1e-6)
         # MMD between two label groups using masks (use standardized z for stability)
         mmd_pen = 0.0
         if cfg.mmd_weight > 0:
@@ -452,7 +675,7 @@ def train_hritik(
     except Exception:
         try:
             from torch.utils.tensorboard import SummaryWriter  # type: ignore
-            writer = SummaryWriter(logdir=str(Path("runs") / "hritik_h2"))
+            writer = SummaryWriter(log_dir=str(Path("runs") / "hritik_h2"))
         except Exception:
             class _Dummy:
                 def add_scalar(self, *a, **k):
@@ -496,6 +719,6 @@ def train_hritik(
     arrays_path = save_path.with_suffix(".arrays.npz")
     arrays_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(arrays_path, **arrays)
-    with open(save_path.with_suffix(".meta.json"), "w") as f:
+    with open(save_path.with_suffix(".meta.json"), "w", encoding="utf-8") as f:
         json.dump({"cfg": cfg.__dict__, "stoi": stoi, "itos": {int(k): v for k, v in enumerate([*stoi.keys()])}}, f)
     print(f"Saved model arrays to {arrays_path}")
