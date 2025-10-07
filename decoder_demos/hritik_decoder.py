@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Optional
 from pathlib import Path
 
 import numpy as np
@@ -40,8 +40,9 @@ from falcon_challenge.dataloaders import load_nwb
 
 def build_default_vocab() -> Tuple[Dict[str, int], Dict[int, str]]:
     # Lowercase a-z, space, punctuation minimal; EOS token
-    chars = list("abcdefghijklmnopqrstuvwxyz") + [" ", ",", ".", "?", "!"]
-    # Note: Eval uses '>' as a space proxy for WER calc, but we output actual spaces here
+    # IMPORTANT: Include '>' (word separator) and '~' (sentence ending) that appear in H2 data
+    chars = list("abcdefghijklmnopqrstuvwxyz") + [" ", ",", ".", "?", "!", ">", "~"]
+    # Note: '>' is used as word separator in H2 dataset, '~' marks sentence end
     special = ["<eos>"]
     vocab = chars + special
     stoi = {ch: i for i, ch in enumerate(vocab)}
@@ -86,6 +87,9 @@ class HritikConfig:
     mmd_weight: float = 0.0
     film: bool = True
     lora_rank: int = 0  # 0 disables LoRA
+    # Temporal handling
+    max_time_bins: int = 256  # length that spikes are resampled to per trial
+    time_downsample: int = 4  # average pooling factor before resampling
     # Autoregressive decoder options
     autoregressive: bool = True
     dec_hidden: int = 256
@@ -95,65 +99,149 @@ class HritikConfig:
     len_penalty: float = 0.0  # >0 encourages longer outputs
     rep_penalty: float = 0.0  # >0 discourages repeated tokens
     temperature: float = 1.0  # logits temperature at decode time
+    top_k: int = 0            # use top-k sampling (0 disables)
+    top_p: float = 1.0        # nucleus sampling cumulative probability threshold
+    max_repeat: int = 0       # when >0, limit identical token run length
+    diversity_penalty: float = 0.0  # penalty applied when exceeding repeat limit
+    label_smoothing: float = 0.1  # smoothing factor applied during training CE
+    entropy_bonus: float = 0.0    # encourages higher token entropy when >0
+    latent_noise_std: float = 0.01  # gaussian noise std added to latent during training
+    enable_latent_transformer: bool = True
+    transformer_layers: int = 2
+    transformer_heads: int = 4
+    transformer_ff_mult: float = 4.0
+    dropout_rate: float = 0.1
+    use_cls_token: bool = True
+    rotary_freq_base: float = 10000.0
 
 
 def glorot(key, shape):
-    fan_in, fan_out = shape[-2], shape[-1]
-    limit = jnp.sqrt(6.0 / (fan_in + fan_out))
+    if not shape:
+        raise ValueError("glorot initializer requires non-empty shape")
+    if len(shape) < 2:
+        fan_in = fan_out = shape[0]
+    else:
+        fan_in = shape[-2]
+        fan_out = shape[-1]
+    denom = max(fan_in + fan_out, 1)
+    limit = jnp.sqrt(6.0 / denom)
     return random.uniform(key, shape, minval=-limit, maxval=limit)
 
 
-def init_params(key, n_channels: int, cfg: HritikConfig) -> Dict[str, Any]:
-    k1, k2, k3, k4 = random.split(key, 4)
+def _downsample_time(spikes: np.ndarray, pool_factor: int) -> np.ndarray:
+    if pool_factor <= 1:
+        return spikes
+    T = spikes.shape[0]
+    if T < pool_factor:
+        return spikes
+    trimmed = T - (T % pool_factor)
+    if trimmed == 0:
+        return spikes
+    reshaped = spikes[:trimmed].reshape(trimmed // pool_factor, pool_factor, spikes.shape[1])
+    return reshaped.mean(axis=1)
 
-    params = {}
-    # Session embedding (learned for seen sessions; unseen will use zero)
+
+def resample_to_length(spikes: np.ndarray, target_len: int) -> np.ndarray:
+    if target_len <= 0:
+        raise ValueError("target_len must be positive")
+    T = spikes.shape[0]
+    if T == 0:
+        return np.zeros((target_len, spikes.shape[1]), dtype=np.float32)
+    if T == target_len:
+        return spikes
+    if T == 1:
+        return np.repeat(spikes, target_len, axis=0)
+    idx = np.linspace(0.0, T - 1.0, target_len, dtype=np.float32)
+    low = np.floor(idx).astype(np.int32)
+    high = np.minimum(low + 1, T - 1)
+    weight = idx - low.astype(np.float32)
+    interpolated = (1.0 - weight)[:, None] * spikes[low] + weight[:, None] * spikes[high]
+    return interpolated.astype(np.float32)
+
+
+def prepare_trial_sequence(spikes: np.ndarray, cfg: HritikConfig) -> np.ndarray:
+    arr = np.asarray(spikes, dtype=np.float32)
+    if arr.ndim != 2:
+        arr = arr.reshape(arr.shape[0], -1)
+    arr = _downsample_time(arr, cfg.time_downsample)
+    arr = resample_to_length(arr, cfg.max_time_bins)
+    return arr.astype(np.float32)
+
+
+def init_params(key, n_channels: int, cfg: HritikConfig) -> Dict[str, Any]:
+    params: Dict[str, Any] = {}
     params["session_embed"] = {}
 
-    # Input projector
-    params["enc_W1"] = glorot(k1, (n_channels, cfg.d_model))
+    key, sub = random.split(key)
+    params["enc_W1"] = glorot(sub, (n_channels, cfg.d_model))
     params["enc_b1"] = jnp.zeros((cfg.d_model,))
 
-    # Latents and attention projections
-    params["latents"] = glorot(k2, (cfg.n_latents, cfg.d_latent))
-    params["attn_Wq"] = glorot(k3, (cfg.d_latent, cfg.d_latent))
-    params["attn_Wk"] = glorot(k3, (cfg.d_model, cfg.d_latent))
-    params["attn_Wv"] = glorot(k4, (cfg.d_model, cfg.d_latent))
+    key, sub = random.split(key)
+    params["latents"] = glorot(sub, (cfg.n_latents, cfg.d_latent))
+    if cfg.use_cls_token:
+        key, sub = random.split(key)
+        params["latent_cls"] = glorot(sub, (cfg.d_latent,))
+
+    key, sub = random.split(key)
+    params["attn_Wq"] = glorot(sub, (cfg.d_latent, cfg.d_latent))
+    key, sub = random.split(key)
+    params["attn_Wk"] = glorot(sub, (cfg.d_model, cfg.d_latent))
+    key, sub = random.split(key)
+    params["attn_Wv"] = glorot(sub, (cfg.d_model, cfg.d_latent))
     params["attn_bo"] = jnp.zeros((cfg.d_latent,))
+
+    if cfg.enable_latent_transformer and cfg.transformer_layers > 0:
+        for layer in range(cfg.transformer_layers):
+            prefix = f"trans_{layer}_self"
+            key, sub = random.split(key)
+            params[f"{prefix}_wq"] = glorot(sub, (cfg.d_latent, cfg.d_latent))
+            key, sub = random.split(key)
+            params[f"{prefix}_wk"] = glorot(sub, (cfg.d_latent, cfg.d_latent))
+            key, sub = random.split(key)
+            params[f"{prefix}_wv"] = glorot(sub, (cfg.d_latent, cfg.d_latent))
+            key, sub = random.split(key)
+            params[f"{prefix}_wo"] = glorot(sub, (cfg.d_latent, cfg.d_latent))
+            params[f"{prefix}_bq"] = jnp.zeros((cfg.d_latent,))
+            params[f"{prefix}_bk"] = jnp.zeros((cfg.d_latent,))
+            params[f"{prefix}_bv"] = jnp.zeros((cfg.d_latent,))
+            params[f"{prefix}_bo"] = jnp.zeros((cfg.d_latent,))
+            prefix_ff = f"trans_{layer}"
+            ff_dim = int(cfg.d_latent * cfg.transformer_ff_mult)
+            key, sub = random.split(key)
+            params[f"{prefix_ff}_ff1_w"] = glorot(sub, (cfg.d_latent, ff_dim))
+            params[f"{prefix_ff}_ff1_b"] = jnp.zeros((ff_dim,))
+            key, sub = random.split(key)
+            params[f"{prefix_ff}_ff2_w"] = glorot(sub, (ff_dim, cfg.d_latent))
+            params[f"{prefix_ff}_ff2_b"] = jnp.zeros((cfg.d_latent,))
 
     # Decoder head
     if cfg.autoregressive:
-        # AR head params will be initialized at train-time when vocab size known
-        # Use float dtype so it's compatible with JAX autodiff (avoid int leaves in params)
         params["ar_initialized"] = jnp.array(0.0, dtype=jnp.float32)
-        # Provisional shapes; real shapes set when stoi size is known
-        params["dec_W_init"] = glorot(k4, (cfg.d_latent, cfg.dec_hidden))
+        key, sub = random.split(key)
+        params["dec_W_init"] = glorot(sub, (cfg.d_latent, cfg.dec_hidden)) * 0.5
         params["dec_b_init"] = jnp.zeros((cfg.dec_hidden,))
-        # GRU weights: z,r gates and candidate
-        # Shapes depend on (dec_embed + d_latent) -> dec_hidden
         din = cfg.dec_embed + cfg.d_latent
-        H = cfg.dec_hidden
-        k5, k6, k7, k8, k9, k10 = random.split(k4, 6)
-        params["gru_Wz"] = glorot(k5, (din, H))
-        params["gru_Uz"] = glorot(k6, (H, H))
-        params["gru_bz"] = jnp.zeros((H,))
-        params["gru_Wr"] = glorot(k7, (din, H))
-        params["gru_Ur"] = glorot(k8, (H, H))
-        params["gru_br"] = jnp.zeros((H,))
-        params["gru_Wh"] = glorot(k9, (din, H))
-        params["gru_Uh"] = glorot(k10, (H, H))
-        params["gru_bh"] = jnp.zeros((H,))
-        # Output head and embedding will be (re)initialized with correct vocab later
+        hidden = cfg.dec_hidden
+        key, sub = random.split(key)
+        split_keys = random.split(sub, 6)
+        params["gru_Wz"] = glorot(split_keys[0], (din, hidden))
+        params["gru_Uz"] = glorot(split_keys[1], (hidden, hidden)) * 0.9
+        params["gru_bz"] = jnp.ones((hidden,)) * 0.5
+        params["gru_Wr"] = glorot(split_keys[2], (din, hidden))
+        params["gru_Ur"] = glorot(split_keys[3], (hidden, hidden)) * 0.9
+        params["gru_br"] = jnp.ones((hidden,)) * 0.5
+        params["gru_Wh"] = glorot(split_keys[4], (din, hidden))
+        params["gru_Uh"] = glorot(split_keys[5], (hidden, hidden)) * 0.9
+        params["gru_bh"] = jnp.zeros((hidden,))
     else:
-        # Non-AR independent positions
-        params["dec_W"] = glorot(k4, (cfg.d_latent, cfg.vocab_max_len * 64))  # placeholder; reset at train-time
+        key, sub = random.split(key)
+        params["dec_W"] = glorot(sub, (cfg.d_latent, cfg.vocab_max_len * 64))
         params["dec_b"] = jnp.zeros((cfg.vocab_max_len * 64,))
 
-    # FiLM generator from session embedding
-    params["film_W"] = glorot(k1, (cfg.d_latent, 2 * cfg.d_latent))
+    key, sub = random.split(key)
+    params["film_W"] = glorot(sub, (cfg.d_latent, 2 * cfg.d_latent))
     params["film_b"] = jnp.zeros((2 * cfg.d_latent,))
 
-    # LoRA adapters (optional)
     if cfg.lora_rank > 0:
         r = cfg.lora_rank
         for name, (din, dout) in {
@@ -161,8 +249,8 @@ def init_params(key, n_channels: int, cfg: HritikConfig) -> Dict[str, Any]:
             "attn_Wk": (cfg.d_model, cfg.d_latent),
             "attn_Wv": (cfg.d_model, cfg.d_latent),
         }.items():
-            k_a, _ = random.split(key)
-            params[f"{name}_lora_A"] = glorot(k_a, (din, r))
+            key, sub = random.split(key)
+            params[f"{name}_lora_A"] = glorot(sub, (din, r))
             params[f"{name}_lora_B"] = jnp.zeros((r, dout))
 
     return params
@@ -172,8 +260,90 @@ def linear(x, w, b):
     return x @ w + b
 
 
-def cross_attention(latents, x_enc, params, cfg: HritikConfig):
-    # latents: L x D; x_enc: T x D_in (here mean pooled -> 1 x D)
+def gelu(x):
+    return 0.5 * x * (1.0 + jax.nn.tanh(jnp.sqrt(2.0 / jnp.pi) * (x + 0.044715 * jnp.power(x, 3))))
+
+
+def layer_norm(x, eps=1e-6):
+    mean = jnp.mean(x, axis=-1, keepdims=True)
+    var = jnp.var(x, axis=-1, keepdims=True)
+    return (x - mean) / jnp.sqrt(var + eps)
+
+
+def _split_heads(x, num_heads: int):
+    length, dim = x.shape
+    head_dim = dim // num_heads
+    x = x.reshape(length, num_heads, head_dim)
+    return jnp.transpose(x, (1, 0, 2))  # heads, length, head_dim
+
+
+def _combine_heads(x):
+    heads, length, head_dim = x.shape
+    return jnp.transpose(x, (1, 0, 2)).reshape(length, heads * head_dim)
+
+
+def _scaled_dot_product_attention(q, k, v):
+    dk = q.shape[-1]
+    attn_logits = q @ jnp.transpose(k, (0, 2, 1)) / jnp.sqrt(dk + 1e-6)
+    attn_weights = jax.nn.softmax(attn_logits, axis=-1)
+    return attn_weights @ v
+
+
+def multi_head_attention(inputs_q, inputs_k, inputs_v, params, num_heads: int, prefix: str):
+    wq = params[f"{prefix}_wq"]
+    wk = params[f"{prefix}_wk"]
+    wv = params[f"{prefix}_wv"]
+    wo = params[f"{prefix}_wo"]
+    bq = params[f"{prefix}_bq"]
+    bk = params[f"{prefix}_bk"]
+    bv = params[f"{prefix}_bv"]
+    bo = params[f"{prefix}_bo"]
+
+    q = inputs_q @ wq + bq
+    k = inputs_k @ wk + bk
+    v = inputs_v @ wv + bv
+
+    q_heads = _split_heads(q, num_heads)
+    k_heads = _split_heads(k, num_heads)
+    v_heads = _split_heads(v, num_heads)
+
+    attn_output = _scaled_dot_product_attention(q_heads, k_heads, v_heads)
+    attn_output = _combine_heads(attn_output)
+    return attn_output @ wo + bo
+
+
+def sinusoidal_positional_encoding(length: int, dim: int, base: float = 10000.0) -> jnp.ndarray:
+    position = jnp.arange(length)[:, None]
+    div_term = jnp.exp(jnp.arange(0, dim, 2) * (-jnp.log(base) / dim))
+    pe = jnp.zeros((length, dim))
+    pe = pe.at[:, 0::2].set(jnp.sin(position * div_term))
+    pe = pe.at[:, 1::2].set(jnp.cos(position * div_term))
+    return pe
+
+
+def apply_transformer_stack(latents: jnp.ndarray, params, cfg: HritikConfig) -> jnp.ndarray:
+    if not cfg.enable_latent_transformer or cfg.transformer_layers <= 0:
+        return latents
+    heads = max(1, int(cfg.transformer_heads))
+    length = latents.shape[0]
+    pos_enc = sinusoidal_positional_encoding(length, latents.shape[-1], cfg.rotary_freq_base)
+    h = latents + pos_enc
+    for layer in range(cfg.transformer_layers):
+        prefix = f"trans_{layer}"
+        h_norm = layer_norm(h)
+        attn_out = multi_head_attention(h_norm, h_norm, h_norm, params, heads, prefix + "_self")
+        h = h + attn_out
+        ff_norm = layer_norm(h)
+        w1 = params[f"{prefix}_ff1_w"]
+        b1 = params[f"{prefix}_ff1_b"]
+        w2 = params[f"{prefix}_ff2_w"]
+        b2 = params[f"{prefix}_ff2_b"]
+        ff = gelu(ff_norm @ w1 + b1)
+        ff = ff @ w2 + b2
+        h = h + ff
+    return h
+def cross_attention(latents, x_enc, params, cfg: HritikConfig, return_weights: bool = False):
+    # latents: L x D_latent; x_enc: T x D_model
     Wq, Wk, Wv = params["attn_Wq"], params["attn_Wk"], params["attn_Wv"]
     # Apply LoRA adapters if configured
     if cfg.lora_rank > 0:
@@ -183,13 +353,17 @@ def cross_attention(latents, x_enc, params, cfg: HritikConfig):
             Wk = Wk + params["attn_Wk_lora_A"] @ params["attn_Wk_lora_B"]
         if "attn_Wv_lora_A" in params and "attn_Wv_lora_B" in params:
             Wv = Wv + params["attn_Wv_lora_A"] @ params["attn_Wv_lora_B"]
-    q = latents @ Wq  # L x D
-    k = x_enc @ Wk    # B(=1) x D
-    v = x_enc @ Wv
-    attn = jax.nn.softmax((q @ k.T) / jnp.sqrt(q.shape[-1]), axis=0)  # L x 1
-    out = attn * v  # broadcast to L x D
+    q = latents @ Wq  # L x D_latent
+    k = x_enc @ Wk    # T x D_latent
+    v = x_enc @ Wv    # T x D_latent
+    scale = jnp.sqrt(q.shape[-1])
+    attn_scores = (q @ k.T) / (scale + 1e-6)  # L x T
+    attn = jax.nn.softmax(attn_scores, axis=1)  # attend over time
+    out = attn @ v  # L x D_latent
     out = out + params["attn_bo"]
-    return out  # L x D
+    if return_weights:
+        return out, attn
+    return out  # L x D_latent
 
 
 def apply_film(h, sess_vec, params, cfg: HritikConfig):
@@ -338,6 +512,27 @@ class HritikDecoder(BCIDecoder):
         prev_id = start_id
         beam_size = int(max(1, self.cfg.beam_size))
         temperature = max(1e-3, float(self.cfg.temperature))
+        top_k = max(0, int(self.cfg.top_k))
+        top_p = float(self.cfg.top_p)
+        max_repeat = int(max(0, self.cfg.max_repeat))
+        diversity_penalty = float(self.cfg.diversity_penalty)
+
+        def apply_repeat_block(logits_arr: np.ndarray, history: List[int]) -> np.ndarray:
+            if diversity_penalty <= 0.0 or max_repeat <= 0:
+                return logits_arr
+            if not history:
+                return logits_arr
+            last_token = history[-1]
+            run_len = 1
+            for idx in range(len(history) - 2, -1, -1):
+                if history[idx] == last_token:
+                    run_len += 1
+                else:
+                    break
+            if run_len >= max_repeat:
+                logits_arr = logits_arr.copy()
+                logits_arr[last_token] -= diversity_penalty
+            return logits_arr
 
         def logits_from_h(h):
             logits = h @ Wout + bout
@@ -353,7 +548,36 @@ class HritikDecoder(BCIDecoder):
                 if self.cfg.rep_penalty > 0.0 and len(seq) > 0:
                     # Penalize last token repetition
                     logits = logits.at[prev_id].add(-self.cfg.rep_penalty)
-                next_id = int(jnp.argmax(logits))
+                logits_np = np.array(logits, dtype=np.float32)
+                logits_np = apply_repeat_block(logits_np, seq)
+                if top_k > 0 and top_k < logits_np.shape[0]:
+                    cutoff_idx = np.argpartition(logits_np, -top_k)[:-top_k]
+                    logits_np[cutoff_idx] = -np.inf
+                probs = np.array(jax.nn.softmax(jnp.asarray(logits_np)), dtype=np.float64)
+                if top_p < 1.0:
+                    sorted_idx = np.argsort(-probs)
+                    cumulative = np.cumsum(probs[sorted_idx])
+                    mask = cumulative > top_p
+                    if mask.any():
+                        first_true = int(np.argmax(mask))
+                        mask[: first_true + 1] = False
+                        probs[sorted_idx[mask]] = 0.0
+                        prob_sum = probs.sum()
+                        if prob_sum <= 0:
+                            probs = np.array(jax.nn.softmax(jnp.asarray(logits_np)), dtype=np.float64)
+                        else:
+                            probs = probs / prob_sum
+                prob_sum = probs.sum()
+                if not np.isfinite(prob_sum) or prob_sum <= 0:
+                    probs = np.ones_like(probs) / probs.size
+                else:
+                    probs = probs / prob_sum
+                do_sample = (top_k > 0 or top_p < 1.0)
+                if do_sample:
+                    self.rng, sample_key = random.split(self.rng)
+                    next_id = int(random.choice(sample_key, jnp.arange(self.vocab_size), p=jnp.asarray(probs, dtype=jnp.float32)))
+                else:
+                    next_id = int(np.argmax(probs))
                 if next_id == eos_id:
                     break
                 seq.append(next_id)
@@ -363,7 +587,7 @@ class HritikDecoder(BCIDecoder):
         else:
             # Simple beam search over AR decoder
             beams = [(0.0, [], prev_id, h)]  # (score, seq, prev_id, h)
-            for t in range(max_len):
+            for _ in range(max_len):
                 new_beams = []
                 for score, seq, prev_id, h in beams:
                     emb = E[prev_id]
@@ -372,7 +596,9 @@ class HritikDecoder(BCIDecoder):
                     logits = logits_from_h(h_new)
                     if self.cfg.rep_penalty > 0.0 and len(seq) > 0:
                         logits = logits.at[seq[-1]].add(-self.cfg.rep_penalty)
-                    log_probs = jax.nn.log_softmax(logits)
+                    logits_np = np.array(logits, dtype=np.float32)
+                    logits_np = apply_repeat_block(logits_np, seq)
+                    log_probs = jax.nn.log_softmax(jnp.asarray(logits_np))
                     topk = int(min(self.vocab_size, beam_size))
                     # get topk indices
                     top_ids = np.array(jnp.argsort(-log_probs)[:topk])
@@ -399,25 +625,29 @@ class HritikDecoder(BCIDecoder):
             return decode_ids(ids, itos)
 
     def decode_trial(self, spikes: np.ndarray, session_id: str) -> str:
-        x = jnp.asarray(spikes)
         params = self.params
         cfg = self.cfg
-        # Encode per-trial summary (mean pooling over time)
-        x_mean = jnp.mean(x, axis=0)  # C
-        # Apply normalization if available
+        seq = prepare_trial_sequence(spikes, cfg)
+        x = jnp.asarray(seq)
         if params is not None and "enc_norm_mean" in params and "enc_norm_std" in params:
             eps = 1e-6
-            x_mean = (x_mean - params["enc_norm_mean"]) / (params["enc_norm_std"] + eps)
-        h = jax.nn.relu(linear(x_mean, params["enc_W1"], params["enc_b1"]))  # D
-        # Perceiver-like cross-attn from latents to encoded summary
+            x = (x - params["enc_norm_mean"]) / (params["enc_norm_std"] + eps)
+        proj = jnp.einsum("tc,cd->td", x, params["enc_W1"]) + params["enc_b1"]
+        proj = jax.nn.relu(proj)
         latents = params["latents"]
-        # Session embedding (zero if unseen)
+        if self.cfg.use_cls_token and "latent_cls" in params:
+            latents = latents.at[0].set(params["latent_cls"])
         sess_vec = jnp.zeros((cfg.d_latent,))
         if "session_embed" in params and session_id in params["session_embed"]:
             sess_vec = params["session_embed"][session_id]
-        z = cross_attention(latents, h[None, :], params, cfg)  # L x D
-        z = jnp.mean(z, axis=0)  # D
+        z_latents = cross_attention(latents, proj, params, cfg)
+        z_latents = apply_transformer_stack(z_latents, params, cfg)
+        if cfg.use_cls_token and z_latents.shape[0] > 0:
+            z = z_latents[0]
+        else:
+            z = jnp.mean(z_latents, axis=0)
         z = apply_film(z, sess_vec, params, cfg)
+        z = z / (jnp.linalg.norm(z) + 1e-6) * jnp.sqrt(cfg.d_latent)
         if cfg.autoregressive and params is not None and ("dec_E" in params) and ("dec_Wout" in params):
             return self._decode_autoregressive(z, params, max_len=cfg.vocab_max_len)
         else:
@@ -534,16 +764,16 @@ def train_hritik(
     # Map sessions to numeric labels and pre-tokenize & pre-mean
     sessions = sorted({sess for (_, _, sess) in trials})
     sess2id = {s: i for i, s in enumerate(sessions)}
-    proc = [
-        (np.asarray(spk, dtype=np.float32).mean(axis=0),  # x_mean
-         encode_text(txt, stoi, train_cfg.max_len),
-         np.int32(sess2id[sess]))
-        for (spk, txt, sess) in trials
-    ]
-    # Feature normalization stats (mean/std over training x_mean)
-    x_means = np.stack([p[0] for p in proc]).astype(np.float32)
-    enc_mean = x_means.mean(axis=0)
-    enc_std = x_means.std(axis=0)
+    proc = []
+    seqs = []
+    for spk, txt, sess in trials:
+        seq = prepare_trial_sequence(spk, cfg)
+        seqs.append(seq)
+        proc.append((seq, encode_text(txt, stoi, train_cfg.max_len), np.int32(sess2id[sess])))
+    # Feature normalization stats (mean/std over all frames)
+    stacked = np.concatenate([seq.reshape(-1, seq.shape[-1]) for seq in seqs], axis=0).astype(np.float32)
+    enc_mean = stacked.mean(axis=0)
+    enc_std = stacked.std(axis=0)
     enc_std[enc_std < 1e-6] = 1e-6
 
     # Initialize params and include normalization stats before optimizer init
@@ -551,8 +781,12 @@ def train_hritik(
     D = cfg.d_latent
     if cfg.autoregressive:
         # Initialize AR-specific params with vocab size
-        params["dec_E"] = glorot(rng, (len(stoi), cfg.dec_embed))
-        params["dec_Wout"] = glorot(rng, (cfg.dec_hidden, len(stoi)))
+        # Use smaller initialization for embeddings to prevent extreme values
+        rng, k_emb = random.split(rng)
+        params["dec_E"] = glorot(k_emb, (len(stoi), cfg.dec_embed)) * 0.5
+        # Initialize output weights with smaller scale for stability
+        rng, k_out = random.split(rng)
+        params["dec_Wout"] = glorot(k_out, (cfg.dec_hidden, len(stoi))) * 0.1
         params["dec_bout"] = jnp.zeros((len(stoi),))
         # Keep a float flag to avoid integer leaves in the parameter pytree
         params["ar_initialized"] = jnp.array(1.0, dtype=jnp.float32)
@@ -580,27 +814,49 @@ def train_hritik(
     )
     opt_state = opt.init(params)
 
-    def loss_fn(params, x_mean, token_ids, mask_a, mask_b):
-        # x_mean: (B, C), token_ids: (B, L), labels: (B,)
-        # Encode
-        h = jax.nn.relu(x_mean @ params["enc_W1"] + params["enc_b1"])  # (B, D)
-        # Cross-attend per-sample
-        z = jax.vmap(lambda hv: jnp.mean(cross_attention(params["latents"], hv[None, :], params, cfg), axis=0))(h)  # (B, D)
-        # FiLM zero during training (session vecs not used)
+    def loss_fn(params, x_seq, token_ids, mask_a, mask_b, rng_key=None):
+        # x_seq: (B, T, C)
+        enc_mean = params["enc_norm_mean"]
+        enc_std = params["enc_norm_std"]
+        x_norm = (x_seq - enc_mean) / (enc_std + 1e-6)
+        # Project per timestep
+        proj = jnp.einsum("btc,cd->btd", x_norm, params["enc_W1"]) + params["enc_b1"]
+        proj = jax.nn.relu(proj)
+        base_latents = params["latents"]
+        if cfg.use_cls_token and "latent_cls" in params:
+            base_latents = base_latents.at[0].set(params["latent_cls"])
+
+        def summarize(tokens):
+            lat = cross_attention(base_latents, tokens, params, cfg)
+            lat = apply_transformer_stack(lat, params, cfg)
+            if cfg.use_cls_token and lat.shape[0] > 0:
+                vec = lat[0]
+            else:
+                vec = jnp.mean(lat, axis=0)
+            return vec
+
+        z = jax.vmap(summarize)(proj)
         z = jnp.nan_to_num(z, nan=0.0, posinf=0.0, neginf=0.0)
+        z = z / (jnp.linalg.norm(z, axis=-1, keepdims=True) + 1e-6) * jnp.sqrt(cfg.d_latent)
+        if rng_key is not None and cfg.latent_noise_std > 0.0:
+            noise = random.normal(rng_key, z.shape) * cfg.latent_noise_std
+            z = z + noise
         V = len(stoi)
         L = train_cfg.max_len
         if cfg.autoregressive:
-            # Teacher-forced AR loss
+            # Teacher-forced AR loss with label smoothing
             E = params["dec_E"]
             Winit, binit = params["dec_W_init"], params["dec_b_init"]
             Wout, bout = params["dec_Wout"], params["dec_bout"]
+
+            smoothing = jnp.clip(cfg.label_smoothing, 0.0, 0.49)
 
             def ar_loss_single(zv, toks):
                 # Initialize hidden
                 h0 = jnp.tanh(zv @ Winit + binit)
                 # Build inputs: start token then toks[:-1]
-                start_id = 0  # use first vocab token as start (space typically index 26)
+                # Use space (index 26) as start token since H2 texts typically start after space
+                start_id = 26  # space character - better start token than 'a' (index 0)
                 toks_in = jnp.concatenate([jnp.array([start_id], dtype=jnp.int32), jnp.maximum(toks[:-1], 0)])
                 mask = (toks != -1)
                 def step(carry, t):
@@ -622,15 +878,22 @@ def train_hritik(
                     h_tilde = jnp.tanh(x @ Wh + (r * h) @ Uh + bh)
                     return (1 - z) * h + z * h_tilde
                 h_final, logits_seq = jax.lax.scan(step, h0, jnp.arange(L))
-                # CE
+                # CE with label smoothing (0.1 smoothing)
                 log_probs = logits_seq - jax.scipy.special.logsumexp(logits_seq, axis=-1, keepdims=True)
+                probs_seq = jnp.exp(log_probs)
                 safe_labels = jnp.where(mask, jnp.clip(toks, 0, V - 1), 0)
+                # Label smoothing: mix one-hot with uniform
                 tgt = jax.nn.one_hot(safe_labels, V, dtype=log_probs.dtype)
+                tgt = tgt * (1.0 - smoothing) + smoothing / V
                 ce_per = -jnp.sum(tgt * log_probs, axis=-1)
                 ce = jnp.sum(ce_per * mask) / (jnp.sum(mask) + 1e-6)
-                return ce
+                entropy_per = -jnp.sum(probs_seq * jnp.log(probs_seq + 1e-8), axis=-1)
+                entropy = jnp.sum(entropy_per * mask) / (jnp.sum(mask) + 1e-6)
+                return ce, entropy
 
-            ce = jnp.mean(jax.vmap(ar_loss_single)(z, token_ids))
+            ce_vals, entropy_vals = jax.vmap(ar_loss_single)(z, token_ids)
+            ce = jnp.mean(ce_vals)
+            entropy = jnp.mean(entropy_vals)
         else:
             # Parallel independent positions loss
             logits_flat = z @ params["dec_W"] + params["dec_b"]  # (B, L*V)
@@ -643,6 +906,9 @@ def train_hritik(
             tgt = jax.nn.one_hot(safe_labels, V, dtype=log_probs.dtype)
             ce_per = -jnp.sum(tgt * log_probs, axis=-1)
             ce = jnp.sum(ce_per * mask) / (jnp.sum(mask) + 1e-6)
+            probs = jnp.exp(log_probs)
+            entropy_per = -jnp.sum(probs * jnp.log(probs + 1e-8), axis=-1)
+            entropy = jnp.sum(entropy_per * mask) / (jnp.sum(mask) + 1e-6)
         # MMD between two label groups using masks (use standardized z for stability)
         mmd_pen = 0.0
         if cfg.mmd_weight > 0:
@@ -650,23 +916,20 @@ def train_hritik(
             z_std = jnp.std(z_center) + 1e-6
             z_norm = z_center / z_std
             mmd_pen = mmd_rbf_masked(z_norm, mask_a, mask_b, sigma=1.0)
-        return ce + cfg.mmd_weight * mmd_pen, (ce, mmd_pen)
+        loss = ce + cfg.mmd_weight * mmd_pen - cfg.entropy_bonus * entropy
+        return loss, (ce, mmd_pen, entropy)
 
     @jax.jit
-    def train_step(params, opt_state, x_mean, token_ids, mask_a, mask_b):
-        (loss, (base, mmd_pen)), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, x_mean, token_ids, mask_a, mask_b)
+    def train_step(params, opt_state, x_seq, token_ids, mask_a, mask_b, rng_key):
+        (loss, (base, mmd_pen, entropy)), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, x_seq, token_ids, mask_a, mask_b, rng_key)
         updates, opt_state = opt.update(grads, opt_state, params)
         params = optax.apply_updates(params, updates)
-        return params, opt_state, loss, base, mmd_pen
+        return params, opt_state, loss, base, mmd_pen, entropy
 
     # Build batches
     def to_batches(items, bs):
         for i in range(0, len(items), bs):
             yield items[i : i + bs]
-
-    def cross_attend_single(h_vec):
-        zL = cross_attention(params["latents"], h_vec[None, :], params, cfg)
-        return jnp.mean(zL, axis=0)
 
     # Safe SummaryWriter import
     try:
@@ -690,9 +953,7 @@ def train_hritik(
         pbar = tqdm(list(to_batches(proc, train_cfg.batch_size)), desc=f"Epoch {epoch+1}/{train_cfg.epochs}")
         for batch in pbar:
             # Collate arrays
-            x_mean = np.stack([b[0] for b in batch]).astype(np.float32)
-            # Apply normalization
-            x_mean = (x_mean - enc_mean) / (enc_std + 1e-6)
+            x_seq = np.stack([b[0] for b in batch]).astype(np.float32)
             token_ids = np.stack([b[1] for b in batch]).astype(np.int32)
             labels = np.array([b[2] for b in batch], dtype=np.int32)
             uniq = np.unique(labels)
@@ -703,14 +964,17 @@ def train_hritik(
             else:
                 mask_a = np.zeros_like(labels, dtype=np.float32)
                 mask_b = np.zeros_like(labels, dtype=np.float32)
-            params, opt_state, loss, base, mmd_pen = train_step(
-                params, opt_state, x_mean, token_ids, mask_a, mask_b
+            # Generate RNG key for this step
+            rng, step_key = random.split(rng)
+            params, opt_state, loss, base, mmd_pen, entropy = train_step(
+                params, opt_state, x_seq, token_ids, mask_a, mask_b, step_key
             )
             step += 1
             if step % 10 == 0:
                 writer.add_scalar("loss/total", float(loss), step)
                 writer.add_scalar("loss/xe", float(base), step)
                 writer.add_scalar("loss/mmd", float(mmd_pen), step)
+                writer.add_scalar("stats/token_entropy", float(entropy), step)
             pbar.set_postfix({"loss": float(loss)})
     writer.close()
 
@@ -722,3 +986,98 @@ def train_hritik(
     with open(save_path.with_suffix(".meta.json"), "w", encoding="utf-8") as f:
         json.dump({"cfg": cfg.__dict__, "stoi": stoi, "itos": {int(k): v for k, v in enumerate([*stoi.keys()])}}, f)
     print(f"Saved model arrays to {arrays_path}")
+
+
+def inspect_decoder_distributions(
+    decoder: HritikDecoder,
+    spikes: np.ndarray,
+    session_id: str = "",
+    max_len: Optional[int] = None,
+) -> Dict[str, float]:
+    """Diagnostic helper returning entropy stats for a single trial."""
+    if decoder.params is None:
+        raise ValueError("Decoder parameters are not initialized or loaded.")
+    cfg = decoder.cfg
+    max_len = max_len or cfg.vocab_max_len
+    proj = _project_sequence(decoder, spikes)
+    z, attn_entropy = _latent_summary(decoder, proj, session_id)
+    token_stats = _token_entropy_stats(decoder, z, max_len)
+
+    result = {"attention_entropy": attn_entropy}
+    if token_stats is None:
+        result.update({"avg_token_entropy": float("nan"), "avg_top1_prob": float("nan")})
+        return result
+
+    result.update(token_stats)
+    return result
+
+
+def _project_sequence(decoder: HritikDecoder, spikes: np.ndarray) -> jnp.ndarray:
+    cfg = decoder.cfg
+    params = decoder.params or {}
+    seq = prepare_trial_sequence(spikes, cfg)
+    x = jnp.asarray(seq)
+    if "enc_norm_mean" in params and "enc_norm_std" in params:
+        eps = 1e-6
+        x = (x - params["enc_norm_mean"]) / (params["enc_norm_std"] + eps)
+    proj = jnp.einsum("tc,cd->td", x, params["enc_W1"]) + params.get("enc_b1", 0.0)
+    return jax.nn.relu(proj)
+
+
+def _latent_summary(decoder: HritikDecoder, proj: jnp.ndarray, session_id: str) -> Tuple[jnp.ndarray, float]:
+    cfg = decoder.cfg
+    params = decoder.params or {}
+    latents = params["latents"]
+    if cfg.use_cls_token and "latent_cls" in params:
+        latents = latents.at[0].set(params["latent_cls"])
+    z_latents, attn = cross_attention(latents, proj, params, cfg, return_weights=True)
+    z_latents = apply_transformer_stack(z_latents, params, cfg)
+    sess_vec = jnp.zeros((cfg.d_latent,))
+    if "session_embed" in params and session_id in params["session_embed"]:
+        sess_vec = params["session_embed"][session_id]
+    if cfg.use_cls_token and z_latents.shape[0] > 0:
+        z = z_latents[0]
+    else:
+        z = jnp.mean(z_latents, axis=0)
+    z = apply_film(z, sess_vec, params, cfg)
+    z = z / (jnp.linalg.norm(z) + 1e-6) * jnp.sqrt(cfg.d_latent)
+    attn_entropy = float(-jnp.sum(attn * jnp.log(attn + 1e-8)) / attn.shape[0])
+    return z, attn_entropy
+
+
+def _token_entropy_stats(
+    decoder: HritikDecoder, z: jnp.ndarray, max_len: int
+) -> Optional[Dict[str, float]]:
+    cfg = decoder.cfg
+    params = decoder.params or {}
+    if not cfg.autoregressive or "dec_E" not in params:
+        return None
+
+    h = jnp.tanh(z @ params["dec_W_init"] + params["dec_b_init"])
+    start_id = decoder.stoi.get(" ", 0)
+    prev_id = start_id
+    entropies: List[float] = []
+    top1_probs: List[float] = []
+    for _ in range(max_len):
+        emb = params["dec_E"][prev_id]
+        x_in = jnp.concatenate([emb, z], axis=-1)
+        h = decoder._gru_step(h, x_in, params)
+        logits = h @ params["dec_Wout"] + params["dec_bout"]
+        logits = logits / max(1e-3, cfg.temperature)
+        probs = jax.nn.softmax(logits)
+        entropy = -jnp.sum(probs * jnp.log(probs + 1e-8))
+        entropies.append(float(entropy))
+        top1_probs.append(float(jnp.max(probs)))
+        next_id = int(np.argmax(np.array(probs)))
+        if next_id == decoder.stoi["<eos>"]:
+            break
+        prev_id = next_id
+
+    if not entropies:
+        return None
+
+    return {
+        "avg_token_entropy": float(np.mean(entropies)),
+        "avg_top1_prob": float(np.mean(top1_probs)),
+        "steps": float(len(entropies)),
+    }
